@@ -30,6 +30,9 @@
   数量，超过半圈记 `backward`，恰好半圈记 `indeterminate`（后两者不推断缺帧）；每个有效帧
   都成为下一帧的基准，坏帧与未决尾部不影响基准。稽核状态与分片状态、本次响应**同一条原子
   UPDATE** 落库：重试只重放原稽核结果，竞争/解码失败不计数也不推进基准，重启后继续。
+  最近序号与累计缺失数按**十进制文本**无损落库——u64 原始序号达到 2⁶³、累计推断缺失数超出
+  SQLite 有符号 64 位 INTEGER 上限时追加依然成功且数值逐位精确；旧库文件在启动时**就地透明
+  迁移**（审计列由 INTEGER 重建为 TEXT，历史值原样保留），既有会话照常读取（边界示例见 4.7.4）。
 - **丢弃区间审计**：每次跳过都返回 `[start, end)` 区间与各候选的失败原因
   （`length_out_of_bounds` / `crc_failed` / `malformed_escape`）。
 - **结果复用**：同一协议版本 + 输入字节 SHA-256 摘要命中 SQLite 缓存，响应中
@@ -602,6 +605,131 @@ curl -s localhost:8000/sessions/9c7a2af3e7214ac3b06767c42df700f0
 }
 ```
 
+##### 4.7.4 u64 大序号与累计缺失越界（无损持久化，可执行边界示例）
+
+序号字段可以是任意无符号整数宽度（最大 64 位）。当原始序号达到甚至超过 2⁶³，或累计推断缺失数
+超出 SQLite INTEGER 的上限（2⁶³ − 1）时，追加依然正常成功：`last_sequence` 与 `missing_total`
+以**十进制文本**无损持久化（SQLite INTEGER 是有符号 64 位，直接存不下这些值），追加响应与进度
+查询始终返回精确整数。服务启动时旧数据库被**就地透明迁移**（两个宽审计列由 INTEGER 重建为 TEXT，
+历史值按原数值转换），既有会话、最近响应重放与多实例共用行为完全不变。
+
+下面用 64 位序号协议 `sensor-line64`（逻辑体 16 字节：`seq` u64 @0、`addr` u8 @8、长度 u8 @12、
+CRC-16/CCITT-FALSE @14，线帧长 18 字节）演示两个边界场景。先注册协议并创建启用稽核的会话：
+
+```bash
+curl -s -X POST localhost:8000/protocols -H 'Content-Type: application/json' -d '{
+  "protocol_id": "sensor-line64",
+  "version": 1,
+  "sync": [170, 85],
+  "endian": "big",
+  "length_field": {"offset": 12, "size": 1},
+  "crc": {"preset": "CRC-16/CCITT-FALSE", "offset": 14},
+  "fields": [
+    {"name": "seq",  "type": "u64", "offset": 0},
+    {"name": "addr", "type": "u8",  "offset": 8}
+  ],
+  "sequence_field": "seq",
+  "max_frame_length": 64
+}'
+
+curl -s -X POST localhost:8000/sessions -H 'Content-Type: application/json' -d '{
+  "protocol_id": "sensor-line64",
+  "version": 1,
+  "sequence_audit": true
+}'
+# -> 201 {"session_id": "2f5a5566f29748c4b74c85d539c6276b", ...,
+#        "sequence_audit": {"bit_width": 64, "last_sequence": null, ...}}
+```
+
+**场景一：原始序号跨过 2⁶³。** 一片携带序号 2⁶³−1 与 2⁶³ 两帧（各 18 字节）：
+
+```bash
+curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/json' -d '{
+  "session_id": "2f5a5566f29748c4b74c85d539c6276b",
+  "expected_offset": 0,
+  "chunk_b64": "qlV//////////wMAAAAQAM4TqlWAAAAAAAAAAAMAAAAQADOH"
+}'
+```
+
+```json
+{
+  "received_offset": 0,
+  "next_offset": 36,
+  "frames": [
+    {"start": 0,  "end": 18, "sequence": 9223372036854775807, "crc_ok": true, "fields": [ ... ]},
+    {"start": 18, "end": 36, "sequence": 9223372036854775808, "crc_ok": true, "fields": [ ... ]}
+  ],
+  "sequence_audit": {
+    "bit_width": 64,
+    "last_sequence": 9223372036854775808,
+    "anomalies": [],
+    "duplicates": 0,
+    "suspected_gaps": 0,
+    "backwards": 0,
+    "indeterminates": 0,
+    "missing_total": 0
+  },
+  "frame_count": 2,
+  "frames_total": 2,
+  "replayed": false
+}
+```
+
+2⁶³−1 → 2⁶³ 是模 2⁶⁴ 的正常一步（无异常），基准精确落在 `9223372036854775808`（= 2⁶³），
+不再受 SQLite 有符号 64 位上限约束。
+
+**场景二：累计推断缺失数越过 2⁶³ − 1。** 新建会话，依次确认序号 0、2⁶³−1、0、2⁶³−1 四帧
+（模 2⁶⁴ 的半圈是 2⁶³）：
+
+```bash
+curl -s -X POST localhost:8000/sessions -H 'Content-Type: application/json' -d '{
+  "protocol_id": "sensor-line64",
+  "version": 1,
+  "sequence_audit": true
+}'
+# -> 201 {"session_id": "360c623ab16b46fba20019dfe285fc92", ...}
+
+curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/json' -d '{
+  "session_id": "360c623ab16b46fba20019dfe285fc92",
+  "expected_offset": 0,
+  "chunk_b64": "qlUAAAAAAAAAAAMAAAAQAGT5qlV//////////wMAAAAQAM4TqlUAAAAAAAAAAAMAAAAQAGT5qlV//////////wMAAAAQAM4T"
+}'
+```
+
+```json
+{
+  "received_offset": 0,
+  "next_offset": 72,
+  "sequence_audit": {
+    "bit_width": 64,
+    "last_sequence": 9223372036854775807,
+    "anomalies": [
+      {"type": "suspected_gap", "frame_start": 18, "frame_end": 36,
+       "previous_sequence": 0, "sequence": 9223372036854775807,
+       "missing": 9223372036854775806},
+      {"type": "backward", "frame_start": 36, "frame_end": 54,
+       "previous_sequence": 9223372036854775807, "sequence": 0,
+       "missing": null},
+      {"type": "suspected_gap", "frame_start": 54, "frame_end": 72,
+       "previous_sequence": 0, "sequence": 9223372036854775807,
+       "missing": 9223372036854775806}
+    ],
+    "duplicates": 0,
+    "suspected_gaps": 2,
+    "backwards": 1,
+    "indeterminates": 0,
+    "missing_total": 18446744073709551612
+  },
+  "frame_count": 4,
+  "frames_total": 4,
+  "replayed": false
+}
+```
+
+两次疑似缺帧各推断缺失 2⁶³ − 2 帧，累计 `missing_total` = 2⁶⁴ − 4 = 18446744073709551612，
+超出有符号 64 位仍逐位精确；`GET /sessions/{id}` 返回同样的精确值，同分片重试重放、失败不推进、
+重启续判与多实例共用数据库后的比较基准均不受影响（对应 `tests/test_sequence_audit_wide.py`）。
+
 ## 协议声明字段
 
 | 字段 | 说明 |
@@ -709,3 +837,8 @@ dangling 转义符）只产出一次且偏移为累计位置、最近分片同�
 的分类、每个有效帧重设基准、坏帧与未决尾部不动基准、位域序号按 `bit_width` 取模、重试重放
 稽核区块不重复计数、409/422 不动稽核状态、重启后从持久化基准续判、进度累计各类异常次数、
 旧库文件就地迁移后老会话照常使用，以及多实例竞争下异常只计一次。
+`tests/test_sequence_audit_wide.py` 覆盖 u64 边界：原始序号达到 2⁶³ 与 2⁶⁴−1 时追加成功且
+异常明细/字节偏移/累计计数逐位精确、依次确认 0、2⁶³−1、0、2⁶³−1 时累计缺失数达 2⁶⁴−4 仍精确、
+恰好半圈（2⁶³）判 `indeterminate`、宽值重试重放不重复计数、409/413 不推进宽基准、重启与多实例
+共用数据库后从持久化宽基准续判、宽审计列仍为 INTEGER 的旧库就地重建为 TEXT 后历史值不变且可
+继续写入超大序号，以及未启用稽核会话与无状态 `/decode` 对同样宽序号的行为保持不变。

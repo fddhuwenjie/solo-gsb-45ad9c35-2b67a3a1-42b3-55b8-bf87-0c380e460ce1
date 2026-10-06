@@ -9,6 +9,64 @@ from typing import Any
 
 from .models import DecodeResponse, ProtocolDefinition
 
+# Every column of the sessions table, in declaration order. Used by the
+# in-place rebuild that converts pre-existing databases to the wide audit
+# column format (see _migrate_sessions).
+_SESSION_COLUMNS = (
+    "session_id",
+    "protocol_id",
+    "version",
+    "received_offset",
+    "tail_b64",
+    "frames_total",
+    "last_chunk_offset",
+    "last_chunk_sha256",
+    "last_response",
+    "audit_enabled",
+    "audit_bit_width",
+    "audit_last_sequence",
+    "audit_duplicates",
+    "audit_suspected_gaps",
+    "audit_backwards",
+    "audit_indeterminates",
+    "audit_missing_total",
+    "created_at",
+    "updated_at",
+)
+
+# Audit values that do not fit SQLite's signed 64-bit INTEGER:
+# audit_last_sequence can be any raw u64 sequence (up to 2**64 - 1) and
+# audit_missing_total accumulates inferred gaps without bound. Both are
+# persisted as decimal text, which is lossless at any magnitude.
+_WIDE_AUDIT_COLUMNS = ("audit_last_sequence", "audit_missing_total")
+
+
+def _sessions_table_sql(table: str) -> str:
+    return f"""
+CREATE TABLE IF NOT EXISTS {table} (
+    session_id        TEXT PRIMARY KEY,
+    protocol_id       TEXT NOT NULL,
+    version           INTEGER NOT NULL,
+    received_offset   INTEGER NOT NULL,
+    tail_b64          TEXT NOT NULL,
+    frames_total      INTEGER NOT NULL DEFAULT 0,
+    last_chunk_offset INTEGER,
+    last_chunk_sha256 TEXT,
+    last_response     TEXT NOT NULL,
+    audit_enabled        INTEGER NOT NULL DEFAULT 0,
+    audit_bit_width      INTEGER,
+    audit_last_sequence  TEXT,
+    audit_duplicates     INTEGER NOT NULL DEFAULT 0,
+    audit_suspected_gaps INTEGER NOT NULL DEFAULT 0,
+    audit_backwards      INTEGER NOT NULL DEFAULT 0,
+    audit_indeterminates INTEGER NOT NULL DEFAULT 0,
+    audit_missing_total  TEXT NOT NULL DEFAULT '0',
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS protocols (
     protocol_id   TEXT NOT NULL,
@@ -27,43 +85,22 @@ CREATE TABLE IF NOT EXISTS decode_cache (
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (protocol_id, version, input_sha256)
 );
-
-CREATE TABLE IF NOT EXISTS sessions (
-    session_id        TEXT PRIMARY KEY,
-    protocol_id       TEXT NOT NULL,
-    version           INTEGER NOT NULL,
-    received_offset   INTEGER NOT NULL,
-    tail_b64          TEXT NOT NULL,
-    frames_total      INTEGER NOT NULL DEFAULT 0,
-    last_chunk_offset INTEGER,
-    last_chunk_sha256 TEXT,
-    last_response     TEXT NOT NULL,
-    audit_enabled        INTEGER NOT NULL DEFAULT 0,
-    audit_bit_width      INTEGER,
-    audit_last_sequence  INTEGER,
-    audit_duplicates     INTEGER NOT NULL DEFAULT 0,
-    audit_suspected_gaps INTEGER NOT NULL DEFAULT 0,
-    audit_backwards      INTEGER NOT NULL DEFAULT 0,
-    audit_indeterminates INTEGER NOT NULL DEFAULT 0,
-    audit_missing_total  INTEGER NOT NULL DEFAULT 0,
-    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
-);
-"""
+""" + _sessions_table_sql("sessions")
 
 # Sequence-audit columns were added after the initial release. Existing
 # database files keep their old sessions table (CREATE TABLE IF NOT EXISTS
 # never alters it), so add any missing column in place; sessions created
-# before the upgrade simply have the audit disabled.
+# before the upgrade simply have the audit disabled. The two wide columns
+# are added as TEXT from the start (see _WIDE_AUDIT_COLUMNS).
 _SESSION_AUDIT_COLUMNS = {
     "audit_enabled": "INTEGER NOT NULL DEFAULT 0",
     "audit_bit_width": "INTEGER",
-    "audit_last_sequence": "INTEGER",
+    "audit_last_sequence": "TEXT",
     "audit_duplicates": "INTEGER NOT NULL DEFAULT 0",
     "audit_suspected_gaps": "INTEGER NOT NULL DEFAULT 0",
     "audit_backwards": "INTEGER NOT NULL DEFAULT 0",
     "audit_indeterminates": "INTEGER NOT NULL DEFAULT 0",
-    "audit_missing_total": "INTEGER NOT NULL DEFAULT 0",
+    "audit_missing_total": "TEXT NOT NULL DEFAULT '0'",
 }
 
 _init_lock = threading.Lock()
@@ -99,6 +136,49 @@ def _migrate_sessions(conn: sqlite3.Connection) -> None:
     for name, ddl in _SESSION_AUDIT_COLUMNS.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
+    _rebuild_sessions_for_wide_audit(conn)
+
+
+def _rebuild_sessions_for_wide_audit(conn: sqlite3.Connection) -> None:
+    """Rebuild the sessions table when the wide audit columns are not TEXT.
+
+    Databases written while ``audit_last_sequence`` / ``audit_missing_total``
+    were INTEGER columns cannot hold raw u64 sequences or cumulative missing
+    counts past 2**63 - 1 (SQLite INTEGER is signed 64-bit, and a numeric
+    string that overflows it would be stored as a lossy REAL). Rebuilding
+    the table with TEXT-affinity columns converts every stored integer to
+    its exact decimal text on copy, so historical sessions read back with
+    the same values they had before the migration.
+    """
+    declared = {
+        row[1]: (row[2] or "").upper()
+        for row in conn.execute("PRAGMA table_info(sessions)")
+    }
+    if all(declared.get(name) == "TEXT" for name in _WIDE_AUDIT_COLUMNS):
+        return
+    cols = ", ".join(_SESSION_COLUMNS)
+    conn.execute("DROP TABLE IF EXISTS sessions_wide_migration")
+    conn.execute(_sessions_table_sql("sessions_wide_migration"))
+    conn.execute(
+        f"INSERT INTO sessions_wide_migration ({cols}) SELECT {cols} FROM sessions"
+    )
+    conn.execute("DROP TABLE sessions")
+    conn.execute("ALTER TABLE sessions_wide_migration RENAME TO sessions")
+
+
+def _encode_wide(value: int | None) -> str | None:
+    """Persist an arbitrary-precision audit integer as exact decimal text."""
+    return None if value is None else str(value)
+
+
+def _decode_wide(value: Any) -> int | None:
+    """Decode a wide audit value read from the database.
+
+    Current rows store decimal text; rows written before the wide format
+    existed (only possible for values below 2**63) hold plain integers.
+    Both decode to the same Python int.
+    """
+    return None if value is None else int(value)
 
 
 class Database:
@@ -199,11 +279,20 @@ class Database:
                 (session_id, protocol_id, version, int(audit_enabled), audit_bit_width),
             )
 
-    def get_session(self, session_id: str) -> sqlite3.Row | None:
+    def get_session(self, session_id: str) -> dict[str, Any] | None:
         cur = self.conn.execute(
             "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
         )
-        return cur.fetchone()
+        row = cur.fetchone()
+        if row is None:
+            return None
+        session = dict(row)
+        # Wide audit values persist as decimal text; hand callers plain
+        # Python ints so comparisons and JSON responses stay exact at any
+        # magnitude (see _WIDE_AUDIT_COLUMNS).
+        session["audit_last_sequence"] = _decode_wide(session["audit_last_sequence"])
+        session["audit_missing_total"] = _decode_wide(session["audit_missing_total"])
+        return session
 
     def save_session_append(
         self,
@@ -256,12 +345,12 @@ class Database:
                     last_chunk_offset,
                     last_chunk_sha,
                     last_response_json,
-                    audit_last_sequence,
+                    _encode_wide(audit_last_sequence),
                     audit_duplicates,
                     audit_suspected_gaps,
                     audit_backwards,
                     audit_indeterminates,
-                    audit_missing_total,
+                    _encode_wide(audit_missing_total),
                     session_id,
                     expected_received_offset,
                 ),
