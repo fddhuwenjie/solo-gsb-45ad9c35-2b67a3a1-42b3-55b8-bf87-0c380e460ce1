@@ -40,12 +40,16 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_response     TEXT NOT NULL,
     audit_enabled        INTEGER NOT NULL DEFAULT 0,
     audit_bit_width      INTEGER,
-    audit_last_sequence  INTEGER,
+    -- Decimal text on purpose: a u64 raw sequence may reach 2**64-1 and the
+    -- cumulative missing-frame count is unbounded, but SQLite integers are
+    -- signed 64-bit. TEXT affinity keeps every value exact; no query does
+    -- arithmetic on these columns, and the app parses them back to ints.
+    audit_last_sequence  TEXT,
     audit_duplicates     INTEGER NOT NULL DEFAULT 0,
     audit_suspected_gaps INTEGER NOT NULL DEFAULT 0,
     audit_backwards      INTEGER NOT NULL DEFAULT 0,
     audit_indeterminates INTEGER NOT NULL DEFAULT 0,
-    audit_missing_total  INTEGER NOT NULL DEFAULT 0,
+    audit_missing_total  TEXT NOT NULL DEFAULT '0',
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -55,16 +59,28 @@ CREATE TABLE IF NOT EXISTS sessions (
 # database files keep their old sessions table (CREATE TABLE IF NOT EXISTS
 # never alters it), so add any missing column in place; sessions created
 # before the upgrade simply have the audit disabled.
+#
+# ``audit_last_sequence`` and ``audit_missing_total`` are TEXT, not INTEGER:
+# SQLite integers are signed 64-bit, while the raw sequence is an unsigned
+# field value (up to 2**64-1 for a u64 sequence field) and the cumulative
+# missing count can grow past 2**63-1 when a stream keeps jumping forward.
+# Both are persisted as exact decimal strings; see _WIDE_AUDIT_COLUMNS /
+# _decode_wide_audit_value. Databases created while those columns were
+# INTEGER (the overflow bug) are rebuilt below.
 _SESSION_AUDIT_COLUMNS = {
     "audit_enabled": "INTEGER NOT NULL DEFAULT 0",
     "audit_bit_width": "INTEGER",
-    "audit_last_sequence": "INTEGER",
+    "audit_last_sequence": "TEXT",
     "audit_duplicates": "INTEGER NOT NULL DEFAULT 0",
     "audit_suspected_gaps": "INTEGER NOT NULL DEFAULT 0",
     "audit_backwards": "INTEGER NOT NULL DEFAULT 0",
     "audit_indeterminates": "INTEGER NOT NULL DEFAULT 0",
-    "audit_missing_total": "INTEGER NOT NULL DEFAULT 0",
+    "audit_missing_total": "TEXT NOT NULL DEFAULT '0'",
 }
+
+# Audit counters that may exceed signed 64-bit range and therefore use TEXT
+# affinity with decimal-string storage. None stays SQL NULL.
+_WIDE_AUDIT_COLUMNS = ("audit_last_sequence", "audit_missing_total")
 
 _init_lock = threading.Lock()
 _initialized: set[str] = set()
@@ -86,7 +102,14 @@ def init_db(db_path: str) -> None:
             return
         conn = _connect(db_path)
         try:
+            # executescript() commits any open transaction first, so the
+            # schema creation runs before the migration transaction below.
             conn.executescript(_SCHEMA)
+            # Migration (including the table rebuild) takes an exclusive
+            # writer lock up front: when several instances share one database
+            # file and initialise simultaneously, only one migrates while the
+            # others wait for the finished, already-canonical schema.
+            conn.execute("BEGIN IMMEDIATE")
             _migrate_sessions(conn)
             conn.commit()
         finally:
@@ -94,11 +117,80 @@ def init_db(db_path: str) -> None:
         _initialized.add(db_path)
 
 
+def _sessions_column_types(conn: sqlite3.Connection) -> dict[str, str]:
+    return {row[1]: (row[2] or "").upper() for row in conn.execute("PRAGMA table_info(sessions)")}
+
+
 def _migrate_sessions(conn: sqlite3.Connection) -> None:
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+    """Bring any older sessions table to the current shape.
+
+    1. Add audit columns missing since the audit feature (created via
+       ALTER TABLE ADD COLUMN, with the current TEXT affinity for the wide
+       counters).
+    2. Rebuild the table when the wide counters have non-TEXT (i.e. INTEGER)
+       affinity — databases created before large u64 sequences / unbounded
+       missing totals were stored exactly. SQLite cannot ALTER a column's
+       affinity, so the canonical 12-step table replacement is used; existing
+       values (all within signed 64-bit, otherwise they could never have been
+       written) are copied verbatim and their type/value is preserved.
+    """
+    types = _sessions_column_types(conn)
     for name, ddl in _SESSION_AUDIT_COLUMNS.items():
-        if name not in existing:
+        if name not in types:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
+            types[name] = ddl.split()[0]
+
+    if all(types.get(name) == "TEXT" for name in _WIDE_AUDIT_COLUMNS):
+        return
+
+    column_names = [
+        row[1]
+        for row in conn.execute("PRAGMA table_info(sessions)")
+    ]
+    collist = ", ".join(column_names)
+    # Individual execute() calls stay inside the caller's BEGIN IMMEDIATE
+    # transaction (executescript would force-commit it), so the replacement
+    # is atomic: a crash or a racing instance never sees a half-renamed table.
+    conn.execute(
+        """
+        CREATE TABLE sessions_new (
+            session_id        TEXT PRIMARY KEY,
+            protocol_id       TEXT NOT NULL,
+            version           INTEGER NOT NULL,
+            received_offset   INTEGER NOT NULL,
+            tail_b64          TEXT NOT NULL,
+            frames_total      INTEGER NOT NULL DEFAULT 0,
+            last_chunk_offset INTEGER,
+            last_chunk_sha256 TEXT,
+            last_response     TEXT NOT NULL,
+            audit_enabled        INTEGER NOT NULL DEFAULT 0,
+            audit_bit_width      INTEGER,
+            audit_last_sequence  TEXT,
+            audit_duplicates     INTEGER NOT NULL DEFAULT 0,
+            audit_suspected_gaps INTEGER NOT NULL DEFAULT 0,
+            audit_backwards      INTEGER NOT NULL DEFAULT 0,
+            audit_indeterminates INTEGER NOT NULL DEFAULT 0,
+            audit_missing_total  TEXT NOT NULL DEFAULT '0',
+            created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+    conn.execute(
+        f"INSERT INTO sessions_new ({collist}) SELECT {collist} FROM sessions"
+    )
+    conn.execute("DROP TABLE sessions")
+    conn.execute("ALTER TABLE sessions_new RENAME TO sessions")
+
+
+def _encode_wide_audit_value(value: int | None) -> str | None:
+    """Decimal text for a counter that may exceed signed 64-bit."""
+    return None if value is None else str(value)
+
+
+def _decode_wide_audit_value(value: int | str | None) -> int | None:
+    """Parse a persisted wide counter (TEXT, or int on never-migrated rows)."""
+    return None if value is None else int(value)
 
 
 class Database:
@@ -256,12 +348,15 @@ class Database:
                     last_chunk_offset,
                     last_chunk_sha,
                     last_response_json,
-                    audit_last_sequence,
+                    # Bound as decimal text: a u64 sequence reaches 2**64-1
+                    # and the missing total is unbounded, neither of which
+                    # fits SQLite's signed-64 INTEGER binding.
+                    _encode_wide_audit_value(audit_last_sequence),
                     audit_duplicates,
                     audit_suspected_gaps,
                     audit_backwards,
                     audit_indeterminates,
-                    audit_missing_total,
+                    _encode_wide_audit_value(audit_missing_total),
                     session_id,
                     expected_received_offset,
                 ),

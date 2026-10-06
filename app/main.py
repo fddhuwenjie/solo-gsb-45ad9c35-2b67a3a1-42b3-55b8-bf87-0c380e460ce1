@@ -23,7 +23,7 @@ from .audit import (
     sequence_bit_width,
 )
 from .config import Settings, get_settings
-from .db import Database
+from .db import Database, _decode_wide_audit_value
 from .decoder import decode_stream
 from .encoder import encode_frame
 from .errors import (
@@ -480,12 +480,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # baseline; every valid frame then becomes the next baseline.
             # Bad frames and the pending tail never reach this point.
             audit_enabled = bool(row["audit_enabled"])
-            audit_last_sequence = row["audit_last_sequence"]
+            audit_last_sequence = _decode_wide_audit_value(row["audit_last_sequence"])
             audit_duplicates = row["audit_duplicates"]
             audit_suspected_gaps = row["audit_suspected_gaps"]
             audit_backwards = row["audit_backwards"]
             audit_indeterminates = row["audit_indeterminates"]
-            audit_missing_total = row["audit_missing_total"]
+            audit_missing_total = _decode_wide_audit_value(row["audit_missing_total"])
             anomalies: list[dict] = []
             if audit_enabled:
                 anomalies, audit_last_sequence, deltas = audit_frames(
@@ -588,12 +588,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if row["audit_enabled"]:
             audit = {
                 "bit_width": row["audit_bit_width"],
-                "last_sequence": row["audit_last_sequence"],
+                "last_sequence": _decode_wide_audit_value(row["audit_last_sequence"]),
                 "duplicates": row["audit_duplicates"],
                 "suspected_gaps": row["audit_suspected_gaps"],
                 "backwards": row["audit_backwards"],
                 "indeterminates": row["audit_indeterminates"],
-                "missing_total": row["audit_missing_total"],
+                "missing_total": _decode_wide_audit_value(row["audit_missing_total"]),
             }
         return {
             "session_id": session_id,

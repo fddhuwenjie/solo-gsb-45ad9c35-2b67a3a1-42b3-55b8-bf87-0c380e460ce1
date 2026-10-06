@@ -62,6 +62,45 @@ def build_logical(seq, addr, temp_s16: int, status: int = 0) -> bytes:
     return bytes(body)
 
 
+# A protocol whose sequence field is a full unsigned 64-bit integer. Its wire
+# frame is sync (2 bytes) + a 12-byte logical body: u64 seq, u8 pad, u8
+# length, one reserved byte, 2-byte CRC.
+U64_SYNC = b"\xaa\x55"
+U64_LOGICAL_LEN = 12
+U64_FRAME_LEN = len(U64_SYNC) + U64_LOGICAL_LEN
+
+
+def u64_protocol(**overrides):
+    proto = {
+        "protocol_id": "sensor-u64",
+        "version": 1,
+        "sync": [0xAA, 0x55],
+        "endian": "big",
+        "length_field": {"offset": 9, "size": 1, "adjustment": 0},
+        "crc": {"preset": "CRC-16/CCITT-FALSE", "offset": 10},
+        "fields": [
+            {"name": "seq", "type": "u64", "offset": 0},
+            {"name": "pad", "type": "u8", "offset": 8},
+        ],
+        "sequence_field": "seq",
+        "max_frame_length": 64,
+    }
+    proto.update(overrides)
+    return proto
+
+
+def build_u64_frame(seq: int, pad: int = 3) -> bytes:
+    """Build one valid u64-sequence wire frame carrying ``seq`` (0..2**64-1)."""
+    body = bytearray(U64_LOGICAL_LEN)
+    body[0:8] = (seq & ((1 << 64) - 1)).to_bytes(8, "big")
+    body[8] = pad & 0xFF
+    body[9] = U64_LOGICAL_LEN
+    covered = bytes(body[:10]) + bytes(body[U64_LOGICAL_LEN:])
+    crc = crc_ccitt(covered)
+    body[10:12] = crc.to_bytes(2, "big")
+    return U64_SYNC + bytes(body)
+
+
 def stuff(raw: bytes, sync=b"\xaa\x55", escape_byte=0x7D, xor_mask=0x20) -> bytes:
     protected = {sync[0], sync[1], escape_byte}
     out = bytearray()

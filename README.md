@@ -28,8 +28,11 @@
   ≥2 的无符号整数序号字段，否则 422 拒绝创建）。每次成功追加只稽核**本次新确认**的有效帧，
   按序号位宽取模比较：相同记 `duplicate`，前进 2 步到不足半圈记 `suspected_gap` 并给出缺失
   数量，超过半圈记 `backward`，恰好半圈记 `indeterminate`（后两者不推断缺帧）；每个有效帧
-  都成为下一帧的基准，坏帧与未决尾部不影响基准。稽核状态与分片状态、本次响应**同一条原子
-  UPDATE** 落库：重试只重放原稽核结果，竞争/解码失败不计数也不推进基准，重启后继续。
+  都成为下一帧的基准，坏帧与未决尾部不影响基准。最近序号（u64 原始值可达 2^64−1）与无上界的
+  累计缺失数以**十进制文本无损**持久化（SQLite 整数仅到 2^63−1，旧 INTEGER 列启动时自动迁移
+  为 TEXT，历史数据原样保留）。稽核状态与分片状态、本次响应**同一条原子 UPDATE** 落库：重试
+  只重放原稽核结果，竞争/解码失败不计数也不推进基准，重启或多实例共用数据库后继续按精确基准
+  比较。边界场景的可执行示例见 4.7.4。
 - **丢弃区间审计**：每次跳过都返回 `[start, end)` 区间与各候选的失败原因
   （`length_out_of_bounds` / `crc_failed` / `malformed_escape`）。
 - **结果复用**：同一协议版本 + 输入字节 SHA-256 摘要命中 SQLite 缓存，响应中
@@ -602,6 +605,173 @@ curl -s localhost:8000/sessions/9c7a2af3e7214ac3b06767c42df700f0
 }
 ```
 
+##### 4.7.4 u64 边界序号与超大累计缺失数（无损持久化）
+
+序号字段可以是完整的 **u64**（如 `"type": "u64"`，`bit_width=64`，模 2^64、半圈 2^63）。
+原始序号可以取到 `2^63 … 2^64-1`，而 SQLite 整数本身是**有符号 64 位**（最大 `2^63-1`），
+因此服务把 `last_sequence` 与累计 `missing_total`（缺失数本身无上界）以**十进制文本无损**
+落库，读回时仍是精确的 Python 整数；JSON 响应也按整数逐位给出。旧版数据库（这两列还是
+INTEGER）在服务启动时**自动就地迁移**（表重建，原有数据原样保留），历史会话照常读取与追加。
+
+注册一个 u64 序号协议（线框 = 同步 `aa 55` + 12 字节逻辑体：8 字节序号 + 1 字节 pad +
+1 字节长度 + 1 保留字节 + 2 字节 CRC）：
+
+```bash
+curl -s -X POST localhost:8000/protocols -H 'Content-Type: application/json' -d '{
+  "protocol_id": "sensor-u64",
+  "version": 1,
+  "sync": [170, 85],
+  "endian": "big",
+  "length_field": {"offset": 9, "size": 1, "adjustment": 0},
+  "crc": {"preset": "CRC-16/CCITT-FALSE", "offset": 10},
+  "fields": [
+    {"name": "seq", "type": "u64", "offset": 0},
+    {"name": "pad", "type": "u8",  "offset": 8}
+  ],
+  "sequence_field": "seq",
+  "max_frame_length": 64
+}'
+
+curl -s -X POST localhost:8000/sessions -H 'Content-Type: application/json' -d '{
+  "protocol_id": "sensor-u64",
+  "version": 1,
+  "sequence_audit": true
+}'
+# 记下返回的 session_id（记为 $SID），sequence_audit.bit_width 应为 64
+```
+
+**边界场景一：原始序号达到并越过 2^63。** 下面的 base64 分片依次携带连续序号
+`2^63-1, 2^63`（28 字节）、`2^63+1`（14 字节，连续前进，均无异常）：
+
+```bash
+# 第 1 片：序号 2^63-1 与 2^63（base64 已构造好，可直接执行）
+curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/json' -d '{
+  "session_id": "'"$SID"'",
+  "expected_offset": 0,
+  "chunk_b64": "qlV//////////wMMywWqVYAAAAAAAAAAAwyR0g=="
+}'
+```
+
+```json
+{
+  "received_offset": 0,
+  "next_offset": 28,
+  "frames": [
+    {"start": 0,  "end": 14, "sequence": 9223372036854775807, "crc_ok": true},
+    {"start": 14, "end": 28, "sequence": 9223372036854775808, "crc_ok": true}
+  ],
+  "sequence_audit": {
+    "bit_width": 64,
+    "last_sequence": 9223372036854775808,
+    "anomalies": [],
+    "duplicates": 0, "suspected_gaps": 0, "backwards": 0, "indeterminates": 0,
+    "missing_total": 0
+  }
+}
+```
+
+```bash
+# 第 2 片：序号 2^63+1（expected_offset 用上一次的 next_offset）
+curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/json' -d '{
+  "session_id": "'"$SID"'",
+  "expected_offset": 28,
+  "chunk_b64": "qlWAAAAAAAAAAQMMpuI="
+}'
+# -> 200，sequence_audit.last_sequence 精确为 9223372036854775809，anomalies 为空
+```
+
+**回绕与边界处的异常明细。** 再追加携带 `2^64-1, 0, 2`（42 字节）的分片：`2^64-1 → 0`
+是模 2^64 的正常一步回绕（无异常），`0 → 2` 判为 `suspected_gap`（缺 1 帧），
+`previous_sequence` / `sequence` / 帧的会话字节偏移都逐位精确；累计 `missing_total`
+也可超过 2^63：
+
+```bash
+curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/json' -d '{
+  "session_id": "'"$SID"'",
+  "expected_offset": 42,
+  "chunk_b64": "qlX//////////wMMLzGqVQAAAAAAAAAAAwx15qpVAAAAAAAAAAIDDBuG"
+}'
+```
+
+```json
+{
+  "received_offset": 42,
+  "next_offset": 84,
+  "frames": [
+    {"start": 42, "end": 56, "sequence": 18446744073709551615},
+    {"start": 56, "end": 70, "sequence": 0},
+    {"start": 70, "end": 84, "sequence": 2}
+  ],
+  "sequence_audit": {
+    "bit_width": 64,
+    "last_sequence": 2,
+    "anomalies": [
+      {"type": "suspected_gap", "frame_start": 70, "frame_end": 84,
+       "previous_sequence": 0, "sequence": 2, "missing": 1}
+    ],
+    "missing_total": 9223372036854775806
+  }
+}
+```
+
+**边界场景二：单帧序号都不超过 2^63−1，累计缺失数仍越过 2^63。** 新建一个稽核会话，
+先发序号 `0` 一片（14 字节），随后把同一分片 `0, 2^63-1`（28 字节）连续追加两次：
+`0 → 2^63-1` 每次都判 `suspected_gap`（缺 `2^63-2` 帧），`2^63-1 → 0` 越过半圈判
+`backward`（不推断缺帧）。第 2 次后累计缺失数为 `2×(2^63-2) = 18446744073709551612`，
+追加返回 200 且数值无损（旧版在此处会因越界返回 500）：
+
+```bash
+# 第 1 片：仅序号 0
+curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/json' -d '{
+  "session_id": "'"$SID2"'",
+  "expected_offset": 0,
+  "chunk_b64": "qlUAAAAAAAAAAAMMdeY="
+}'
+
+# 第 2 片：0, 2^63-1（missing_total 变为 9223372036854775806）
+curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/json' -d '{
+  "session_id": "'"$SID2"'",
+  "expected_offset": 14,
+  "chunk_b64": "qlUAAAAAAAAAAAMMdeaqVX//////////AwzLBQ=="
+}'
+
+# 第 3 片：0, 2^63-1 再来一次（累计缺失数越过 2^63，精确为 18446744073709551612）
+curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/json' -d '{
+  "session_id": "'"$SID2"'",
+  "expected_offset": 42,
+  "chunk_b64": "qlUAAAAAAAAAAAMMdeaqVX//////////AwzLBQ=="
+}'
+```
+
+```json
+{
+  "sequence_audit": {
+    "bit_width": 64,
+    "last_sequence": 9223372036854775807,
+    "anomalies": [
+      {"type": "backward", "previous_sequence": 9223372036854775807, "sequence": 0, "missing": null},
+      {"type": "suspected_gap", "previous_sequence": 0,
+       "sequence": 9223372036854775807, "missing": 9223372036854775806}
+    ],
+    "suspected_gaps": 2,
+    "backwards": 1,
+    "missing_total": 18446744073709551612
+  }
+}
+```
+
+进度查询与重启读回同样无损；同分片重试仍只重放原响应（包含完整的大数稽核区块），
+多实例共用同一数据库文件时也以持久化的精确基准继续比较：
+
+```bash
+curl -s localhost:8000/sessions/$SID2
+# -> sequence_audit.last_sequence = 9223372036854775807
+#    sequence_audit.missing_total = 18446744073709551612
+```
+
+> 说明：这些序号本来就无法用 JSON 安全整数（2^53−1）精确表示，客户端请按字符串/
+> 任意精度整数解析；服务端始终按精确整数处理，不经过浮点。
+
 ## 协议声明字段
 
 | 字段 | 说明 |
@@ -675,7 +845,7 @@ app/
   decoder.py   # 候选扫描、反转义、长度/CRC 校验、重同步与歧义判定
   encoder.py   # 字段写入（位域/定点反算/冲突检测）、长度与 CRC 派生、转义、回读校验
   audit.py     # 会话序号连续性稽核（取模比较、异常分类、基准推进）
-  db.py        # SQLite：协议表 + (协议版本, 输入摘要) 结果缓存 + 采集会话状态表（含稽核列）
+  db.py        # SQLite：协议表 + (协议版本, 输入摘要) 结果缓存 + 采集会话状态表（稽核列；u64 序号与累计缺失数十进制文本无损落库）
   errors.py    # 结构化错误类型
   main.py      # FastAPI 路由与错误处理（/decode、/encode、/sessions[/append]）
 tests/         # pytest 用例（含构造 CRC 碰撞的歧义用例、编码回读校验、会话跨分片/重试/重启、序号稽核）
@@ -708,4 +878,7 @@ dangling 转义符）只产出一次且偏移为累计位置、最近分片同�
 2 位可建）、未启用会话行为不变、重复/疑似缺帧（含缺失数量与回绕取模）/倒退/恰好半圈无法判向
 的分类、每个有效帧重设基准、坏帧与未决尾部不动基准、位域序号按 `bit_width` 取模、重试重放
 稽核区块不重复计数、409/422 不动稽核状态、重启后从持久化基准续判、进度累计各类异常次数、
-旧库文件就地迁移后老会话照常使用，以及多实例竞争下异常只计一次。
+旧库文件就地迁移后老会话照常使用，以及多实例竞争下异常只计一次；并覆盖 **u64 边界**：序号
+达到 2^63 / 2^64−1 与回绕、异常明细与字节偏移逐位精确、重复 `0,2^63−1` 使累计缺失数越过
+2^63（无损落库为十进制文本，INTEGER 旧列自动重建迁移）、失败不推进、重启与多实例共用库后继续
+按精确基准比较。

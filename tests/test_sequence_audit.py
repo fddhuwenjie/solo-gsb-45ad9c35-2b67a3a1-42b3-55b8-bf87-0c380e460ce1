@@ -27,7 +27,16 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
-from tests.conftest import b64, build_logical, standard_protocol
+from tests.conftest import (
+    U64_FRAME_LEN,
+    U64_LOGICAL_LEN,
+    U64_SYNC,
+    b64,
+    build_logical,
+    build_u64_frame,
+    standard_protocol,
+    u64_protocol,
+)
 
 SYNC = b"\xaa\x55"
 FRAME_LEN = len(SYNC) + 9  # standard protocol wire frame: sync + 9-byte body
@@ -568,3 +577,314 @@ def test_two_instances_identical_chunk_race_counts_audit_once(db_path):
             audit = progress["sequence_audit"]
             assert audit["duplicates"] == 1
             assert audit["last_sequence"] == 1
+
+
+# ----------------------------------------------- u64 boundary persistence ----
+#
+# SQLite integers are signed 64-bit, but a u64 sequence field's raw value
+# reaches 2**63..2**64-1 and the cumulative missing-frame count is unbounded.
+# The wide counters are therefore stored as exact decimal text.
+
+
+def register_u64(client, **overrides):
+    r = client.post("/protocols", json=u64_protocol(**overrides))
+    assert r.status_code == 201, r.text
+    return r
+
+
+def make_u64_session(client):
+    r = client.post(
+        "/sessions",
+        json={"protocol_id": "sensor-u64", "version": 1, "sequence_audit": True},
+    )
+    assert r.status_code == 201, r.text
+    audit = r.json()["sequence_audit"]
+    assert audit["bit_width"] == 64
+    return r.json()["session_id"]
+
+
+def append_u64(client, sid, offset, *seqs):
+    chunk = b"".join(build_u64_frame(s) for s in seqs)
+    r = client.post(
+        "/sessions/append",
+        json={"session_id": sid, "expected_offset": offset, "chunk_b64": b64(chunk)},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # next_offset is the cumulative session position for the following append.
+    return body, body["next_offset"]
+
+
+def test_u64_sequence_at_and_above_signed_boundary_persists_exactly(client):
+    register_u64(client)
+    sid = make_u64_session(client)
+
+    # Consecutive values crossing the signed-64 boundary are normal advances.
+    body, n = append_u64(client, sid, 0, (1 << 63) - 1, 1 << 63)
+    audit = body["sequence_audit"]
+    assert [f["sequence"] for f in body["frames"]] == [(1 << 63) - 1, 1 << 63]
+    assert audit["anomalies"] == []
+    assert audit["last_sequence"] == 1 << 63
+    assert body["next_offset"] == 2 * U64_FRAME_LEN
+
+    # One more step reaches 2**63+1 and is persisted exactly on read-back.
+    body, n = append_u64(client, sid, n, (1 << 63) + 1)
+    assert body["sequence_audit"]["anomalies"] == []
+    assert body["sequence_audit"]["last_sequence"] == (1 << 63) + 1
+    progress = audit_of(client, sid)
+    assert progress["last_sequence"] == (1 << 63) + 1
+    assert progress["missing_total"] == 0
+
+
+def test_u64_wraparound_from_max_to_zero_is_normal_advance(client):
+    register_u64(client)
+    sid = make_u64_session(client)
+
+    body, n = append_u64(client, sid, 0, (1 << 64) - 2, (1 << 64) - 1)
+    assert body["sequence_audit"]["anomalies"] == []
+    body, n = append_u64(client, sid, n, 0, 1)
+    audit = body["sequence_audit"]
+    assert audit["anomalies"] == []
+    assert audit["last_sequence"] == 1
+    assert audit["missing_total"] == 0
+    assert audit_of(client, sid)["last_sequence"] == 1
+
+
+def test_u64_anomaly_details_and_offsets_exact_at_boundary(client):
+    register_u64(client)
+    sid = make_u64_session(client)
+
+    top = (1 << 64) - 1
+    # top -> 0 is a one-step wrap (normal); 0 -> 2 is a gap of one frame.
+    body, n = append_u64(client, sid, 0, top, 0, 2)
+    (anomaly,) = body["sequence_audit"]["anomalies"]
+    assert anomaly["type"] == "suspected_gap"
+    assert anomaly["previous_sequence"] == 0
+    assert anomaly["sequence"] == 2
+    assert anomaly["missing"] == 1
+    assert anomaly["frame_start"] == 2 * U64_FRAME_LEN
+    assert anomaly["frame_end"] == 3 * U64_FRAME_LEN
+    assert [f["start"] for f in body["frames"]] == [0, U64_FRAME_LEN, 2 * U64_FRAME_LEN]
+    assert audit_of(client, sid)["missing_total"] == 1
+
+
+def test_cumulative_missing_total_crosses_signed_boundary(client):
+    """Even with every per-frame sequence inside signed range, repeating
+    0, 2**63-1 pairs drives the cumulative missing count past 2**63-1; the
+    total must stay exact instead of failing the append with a 500."""
+    register_u64(client)
+    sid = make_u64_session(client)
+    half = (1 << 63) - 1
+
+    body, n = append_u64(client, sid, 0, 0)
+    # 0 -> half: suspected gap of half-1 frames; half -> 0 is a backward
+    # jump (one past half a turn), so it infers no missing frames.
+    body, n = append_u64(client, sid, n, 0, half)
+    audit = body["sequence_audit"]
+    assert [a["type"] for a in audit["anomalies"]] == ["duplicate", "suspected_gap"]
+    assert audit["missing_total"] == half - 1
+
+    # Second pair: the running total crosses the signed-64 boundary.
+    body, n = append_u64(client, sid, n, 0, half)
+    audit = body["sequence_audit"]
+    assert [a["type"] for a in audit["anomalies"]] == ["backward", "suspected_gap"]
+    assert audit["last_sequence"] == half
+    expected = 2 * (half - 1)  # == 2**64 - 4
+    assert expected > (1 << 63) - 1
+    assert audit["missing_total"] == expected
+
+    # Read-back from SQLite keeps the full value, and anomaly details of the
+    # boundary append keep their exact (large) previous sequence.
+    progress = audit_of(client, sid)
+    assert progress["missing_total"] == expected
+    assert progress["last_sequence"] == half
+    assert progress["suspected_gaps"] == 2
+    assert progress["backwards"] == 1
+
+
+def test_restart_preserves_u64_baseline_and_huge_missing_total(db_path):
+    half = (1 << 63) - 1
+
+    with TestClient(create_app(Settings(db_path=db_path, max_decode_bytes=1 << 20))) as c:
+        register_u64(c)
+        sid = make_u64_session(c)
+        body, n1 = append_u64(c, sid, 0, 0)
+        body, n2 = append_u64(c, sid, n1, 0, half)
+        body, n3 = append_u64(c, sid, n2, 0, half)
+        assert body["sequence_audit"]["missing_total"] == 2 * (half - 1)
+        last_chunk = b"".join((build_u64_frame(0), build_u64_frame(half)))
+        assert n3 - n2 == len(last_chunk)
+
+    # Restart on the same database file: counters read back exactly, the
+    # identical last chunk replays the stored response verbatim, and the
+    # baseline still classifies subsequent frames correctly.
+    with TestClient(create_app(Settings(db_path=db_path, max_decode_bytes=1 << 20))) as c:
+        audit = audit_of(c, sid)
+        assert audit["last_sequence"] == half
+        assert audit["missing_total"] == 2 * (half - 1)
+
+        r = c.post(
+            "/sessions/append",
+            json={
+                "session_id": sid,
+                "expected_offset": n2,
+                "chunk_b64": b64(last_chunk),
+            },
+        )
+        assert r.status_code == 200, r.text
+        replayed = r.json()
+        assert replayed["replayed"] is True
+        assert replayed["sequence_audit"]["missing_total"] == 2 * (half - 1)
+
+        # half -> half is a duplicate judged against the persisted baseline.
+        r = c.post(
+            "/sessions/append",
+            json={
+                "session_id": sid,
+                "expected_offset": n3,
+                "chunk_b64": b64(build_u64_frame(half)),
+            },
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["frames"][0]["sequence"] == half
+        assert [a["type"] for a in body["sequence_audit"]["anomalies"]] == ["duplicate"]
+        assert body["sequence_audit"]["missing_total"] == 2 * (half - 1)
+
+
+def test_database_with_integer_audit_columns_is_rebuilt_and_data_kept(tmp_path):
+    """A database created while the wide counters were INTEGER columns (the
+    overflow bug) is rebuilt with TEXT affinity; committed counters survive,
+    the session keeps appending, and new sessions reach the full u64 range."""
+    db_file = tmp_path / "integer-audit.db"
+    conn = sqlite3.connect(str(db_file))
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            session_id TEXT PRIMARY KEY, protocol_id TEXT NOT NULL,
+            version INTEGER NOT NULL, received_offset INTEGER NOT NULL,
+            tail_b64 TEXT NOT NULL, frames_total INTEGER NOT NULL DEFAULT 0,
+            last_chunk_offset INTEGER, last_chunk_sha256 TEXT,
+            last_response TEXT NOT NULL,
+            audit_enabled INTEGER NOT NULL DEFAULT 0, audit_bit_width INTEGER,
+            audit_last_sequence INTEGER, audit_duplicates INTEGER NOT NULL DEFAULT 0,
+            audit_suspected_gaps INTEGER NOT NULL DEFAULT 0,
+            audit_backwards INTEGER NOT NULL DEFAULT 0,
+            audit_indeterminates INTEGER NOT NULL DEFAULT 0,
+            audit_missing_total INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO sessions (session_id, protocol_id, version, received_offset, tail_b64,
+            frames_total, last_response, audit_enabled, audit_bit_width,
+            audit_last_sequence, audit_suspected_gaps, audit_missing_total)
+        VALUES ('legacy', 'sensor-u64', 1, 0, '', 0, '', 1, 64, 42, 1, 7);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with TestClient(
+        create_app(Settings(db_path=str(db_file), max_decode_bytes=1 << 20))
+    ) as c:
+        register_u64(c)
+        audit = audit_of(c, "legacy")
+        assert audit["last_sequence"] == 42
+        assert audit["missing_total"] == 7
+        assert audit["suspected_gaps"] == 1
+
+        body, n = append_u64(c, "legacy", 0, 42)
+        assert [a["type"] for a in body["sequence_audit"]["anomalies"]] == ["duplicate"]
+        assert body["sequence_audit"]["missing_total"] == 7
+
+        sid = make_u64_session(c)
+        body, n = append_u64(c, sid, 0, (1 << 63) - 1, 1 << 63)
+        assert body["sequence_audit"]["anomalies"] == []
+        assert body["sequence_audit"]["last_sequence"] == 1 << 63
+
+    # The rebuilt table stores wide counters with TEXT affinity as exact text.
+    conn = sqlite3.connect(str(db_file))
+    stored = conn.execute(
+        "SELECT audit_last_sequence, typeof(audit_last_sequence), "
+        "audit_missing_total, typeof(audit_missing_total) "
+        "FROM sessions WHERE session_id = ?",
+        (sid,),
+    ).fetchone()
+    conn.close()
+    assert tuple(stored) == (str(1 << 63), "text", "0", "text")
+
+
+def test_failed_append_near_boundary_does_not_advance_state(client):
+    """A hard failure (here 413 from an oversized chunk) after earlier
+    large-sequence frames must leave the persisted wide counters untouched
+    (state commits as one unit or not at all); the same offset can then be
+    retried successfully."""
+    register_u64(client)
+    sid = make_u64_session(client)
+
+    body, n = append_u64(client, sid, 0, 1 << 63)
+    assert body["sequence_audit"]["last_sequence"] == 1 << 63
+
+    oversized = bytes([0xAA]) * ((1 << 20) + 1)
+    r = client.post(
+        "/sessions/append",
+        json={"session_id": sid, "expected_offset": n, "chunk_b64": b64(oversized)},
+    )
+    assert r.status_code == 413
+    assert r.json()["error"]["code"] == "PAYLOAD_TOO_LARGE"
+    audit = audit_of(client, sid)
+    assert audit["last_sequence"] == 1 << 63
+    assert audit["missing_total"] == 0
+
+    body, n2 = append_u64(client, sid, n, 1 << 63)
+    assert [a["type"] for a in body["sequence_audit"]["anomalies"]] == ["duplicate"]
+    assert body["sequence_audit"]["last_sequence"] == 1 << 63
+    assert audit_of(client, sid)["duplicates"] == 1
+
+
+def test_two_instances_share_u64_audit_state(db_path):
+    """Two app instances on one database file keep comparing against the
+    exact persisted u64 baseline; an append through the second instance sees
+    the first instance's large sequence without a conflicting replay."""
+    app_a, client_a = make_instance(db_path)
+    app_b, client_b = make_instance(db_path)
+    with client_a, client_b:
+        register_u64(client_a)
+        sid = make_u64_session(client_a)
+
+        body, n = append_u64(client_a, sid, 0, (1 << 64) - 1)
+        assert body["sequence_audit"]["last_sequence"] == (1 << 64) - 1
+
+        # The second instance reads the persisted wide baseline verbatim.
+        assert audit_of(client_b, sid)["last_sequence"] == (1 << 64) - 1
+
+        # max -> 0 is a normal wraparound, not a gap/backward.
+        chunk = build_u64_frame(0) + build_u64_frame(1)
+        r = client_b.post(
+            "/sessions/append",
+            json={"session_id": sid, "expected_offset": n, "chunk_b64": b64(chunk)},
+        )
+        assert r.status_code == 200, r.text
+        audit = r.json()["sequence_audit"]
+        assert audit["anomalies"] == []
+        assert audit["last_sequence"] == 1
+
+        # Resending the most recent chunk through the second instance replays
+        # the stored response; the audit block (last_sequence=1) is returned
+        # verbatim without recounting.
+        replay = client_b.post(
+            "/sessions/append",
+            json={
+                "session_id": sid,
+                "expected_offset": n,
+                "chunk_b64": b64(chunk),
+            },
+        )
+        assert replay.status_code == 200
+        body = replay.json()
+        assert body["replayed"] is True
+        assert body["sequence_audit"]["last_sequence"] == 1
+        assert body["frames_total"] == 3
+
+        for client in (client_a, client_b):
+            assert audit_of(client, sid)["last_sequence"] == 1
